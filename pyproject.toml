@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modular-transcriptor"
+version = "0.1.0"
+description = "Multi-model speech transcription (Parakeet + MMS-CTC + WhisperX merge)"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1",
+    "torchaudio>=2.1",
+    "whisperx>=3.1",
+    "faster-whisper>=1.0",
+    "pyannote.audio>=3.1",
+    "nemo_toolkit[asr]>=2.7",
+    "rapidfuzz>=3.6",
+    "inflect>=7.0",
+    "numpy>=1.24",
+    "structlog>=24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
+
+[project.scripts]
+modular-transcriptor = "modular_transcriptor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["modular_transcriptor*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
