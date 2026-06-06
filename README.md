@@ -139,6 +139,10 @@ model is freed before the next loads: **amplify** (16 kHz mono + gentle gain) â†
 **merge**. Each stage is idempotent (skips if its output already exists), so a run
 pointed at an existing `--work` dir resumes where it left off.
 
-## License / origin
+## Disclaimer
 
-Extracted from the ProjectClipper transcription pipeline.
+This is most likely overkill for 99% of the use cases, as just running base whisper gives 95% accuracy, and the final percents take exponential amount of compute.
+
+This project is specifically useful where you need near perfect transcription without human supervision.
+
+There is definitely still room for improvement due to so many moving parts and it is definitely not in the final state with many bugs still being discovered though the continued use.
