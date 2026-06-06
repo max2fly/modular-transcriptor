@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -25,6 +26,9 @@ def _fake_pipeline(monkeypatch, tmp_path, diar_turns):
             )
 
     monkeypatch.setattr(cli, "_run_stage", fake_run_stage)
+    # Neutralize .env loading so a real .env in the cwd can't inject HF_TOKEN and
+    # invalidate the token-precondition tests.
+    monkeypatch.setattr(cli, "_load_env", lambda: None)
     return inp
 
 
@@ -61,3 +65,13 @@ def test_cli_diarization_success(tmp_path, monkeypatch):
     out = tmp_path / "ok.json"
     rc = cli.main([str(inp), "--out", str(out)])
     assert rc == 0 and out.exists()
+
+
+def test_load_env_reads_file_without_overriding(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("HF_TOKEN=from_dotenv\n# comment\nOTHER=val\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("OTHER", "preexisting")  # already set -> must NOT override
+    cli._load_env()
+    assert os.environ["HF_TOKEN"] == "from_dotenv"
+    assert os.environ["OTHER"] == "preexisting"

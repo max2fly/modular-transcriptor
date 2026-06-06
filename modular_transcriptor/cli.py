@@ -14,6 +14,28 @@ from pathlib import Path
 _PRE_MERGE_STAGES = ["amplify", "parakeet", "mms", "whisper"]
 
 
+def _load_env() -> None:
+    """Load `KEY=VALUE` pairs from a `.env` in the current directory (or the
+    nearest ancestor that has one) into os.environ WITHOUT overriding vars that
+    are already set. Lets users keep HF_TOKEN in a .env instead of exporting it;
+    stage subprocesses inherit the populated environment. Minimal parser:
+    supports `KEY=value` and `# comments`; ignores quoting/`export` syntax."""
+    cwd = Path.cwd()
+    for d in (cwd, *cwd.parents):
+        env = d / ".env"
+        if not env.exists():
+            continue
+        for raw in env.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value.strip()
+        return
+
+
 def _run_stage(stage: str, work: Path, audio: Path) -> None:
     """Run one pipeline stage as a subprocess, streaming its {phase,pct} lines."""
     cmd = [
@@ -66,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
         "--keep-work", action="store_true", help="keep the intermediate work dir"
     )
     args = ap.parse_args(argv)
+
+    _load_env()
 
     inp = Path(args.input).expanduser().resolve()
     if not inp.exists():
