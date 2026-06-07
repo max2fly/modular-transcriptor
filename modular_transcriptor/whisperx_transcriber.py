@@ -56,11 +56,6 @@ class WhisperXTranscriber:
             except Exception as e:  # noqa: BLE001
                 log.warning("phase_cb_failed", err=str(e))
 
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            raise RuntimeError(
-                "HF_TOKEN env var is required for the whisperx align-model download path"
-            )
         decoded = self._predecode_audio(audio_path) if self._predecode else audio_path
         try:
             import whisperx  # type: ignore[import-not-found]
