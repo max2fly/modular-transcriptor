@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 
+from modular_transcriptor import cache
 from modular_transcriptor._logging import get_logger
 from modular_transcriptor.types import PhaseCb
 
@@ -29,8 +30,8 @@ def run(
     device: str = "cuda",
     phase_cb: PhaseCb | None = None,
 ) -> Path:
-    if out_path.exists():
-        log.info("diarize_skip_exists", out=str(out_path))
+    if cache.is_fresh(out_path, audio_path):
+        log.info("diarize_skip_fresh", out=str(out_path))
         return out_path
 
     def emit(label, pct=None):
@@ -86,4 +87,5 @@ def run(
     tmp = out_path.with_suffix(out_path.suffix + ".partial")
     tmp.write_text(json.dumps(turns))
     tmp.replace(out_path)
+    cache.stamp(out_path, audio_path)
     return out_path

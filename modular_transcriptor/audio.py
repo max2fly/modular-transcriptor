@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from modular_transcriptor import cache
 from modular_transcriptor._logging import get_logger
 
 log = get_logger("transcription_audio")
@@ -13,8 +14,16 @@ def amplify_to_wav(
 ) -> Path:
     """Flat-gain amplification + brick-wall limiter to bring quiet speech up
     for the acoustic models WITHOUT dynamic compression (which lifts BGM /
-    causes fishbowl artifacts). Output is 16 kHz mono pcm_s16le. Idempotent:
-    if `dst` already exists it is reused.
+    causes fishbowl artifacts). Output is 16 kHz mono pcm_s16le.
+
+    The WAV is cached so re-running transcription on an unchanged video skips
+    the minutes-long extraction, but the cache is keyed on the source's
+    identity (see `cache`), NOT mere existence: the source video can be
+    re-merged / re-downloaded later — even to the SAME length but different
+    content (a re-cut seam, a replaced segment). A plain exists() check kept the
+    stale WAV, transcribing an obsolete timeline and drifting the transcript
+    progressively ahead of the video. Any change to the source forces a
+    re-extract; a legacy WAV with no sidecar is re-extracted once.
 
     `aresample=async=1` fills audio PTS gaps with silence so the extracted
     waveform stays on the *container* (player/PTS) timeline. Without it, a
@@ -23,8 +32,18 @@ def amplify_to_wav(
     progressively ahead of the canonical video (measured up to ~3.7s of
     drift across a 48-min VOD)."""
     if dst.exists():
-        log.info("amplify_reuse", dst=str(dst))
-        return dst
+        if cache.is_fresh(dst, src):
+            log.info("amplify_reuse", dst=str(dst), src=str(src))
+            return dst
+        log.warning(
+            "amplify_stale_reextract",
+            dst=str(dst),
+            src=str(src),
+            recorded=cache.read_sidecar(dst),
+            current=cache.fingerprint(src),
+        )
+        dst.unlink()
+        cache.clear(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     log.info("amplify_run", src=str(src), dst=str(dst), gain_db=gain_db)
     subprocess.run(
@@ -48,4 +67,5 @@ def amplify_to_wav(
         check=True,
         timeout=timeout_s,
     )
+    cache.stamp(dst, src)
     return dst

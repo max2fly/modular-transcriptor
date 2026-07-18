@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
+
+import pytest
 
 import modular_transcriptor.parakeet_transcriber as pk
+from modular_transcriptor import cache
 
 
 def test_dedup_keeps_longer_text_on_overlap():
@@ -41,8 +46,28 @@ def test_convert_to_canonical_offsets_times():
     assert segs[0]["language"] == "en"
 
 
-def test_run_is_idempotent(tmp_path):
+def test_run_skips_when_output_fresh(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"AUDIO")
+    out = tmp_path / "parakeet.json"
+    out.write_text(json.dumps({"engine": "x", "segments": []}))
+    cache.stamp(out, audio)
+    # If it wrongly proceeds, this poisoned import fails fast (no model load).
+    monkeypatch.setitem(sys.modules, "nemo", types.ModuleType("nemo"))
+    before = out.read_text()
+    assert pk.run(audio, out) == out
+    assert out.read_text() == before  # untouched -> genuinely skipped
+
+
+def test_run_recomputes_when_source_changed(tmp_path, monkeypatch):
+    # A parakeet.json stamped against an older WAV must NOT be reused after the
+    # WAV is re-extracted (the stale-timeline bug that duplicated subtitles).
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"AUDIO")
     out = tmp_path / "parakeet.json"
     out.write_text(json.dumps({"segments": []}))
-    # Must return without importing nemo/torch (which aren't faked here).
-    pk.run(tmp_path / "audio.wav", out)
+    cache.stamp(out, audio)
+    audio.write_bytes(b"RE-EXTRACTED-DIFFERENT")  # WAV changed -> stale
+    monkeypatch.setitem(sys.modules, "nemo", types.ModuleType("nemo"))
+    with pytest.raises(ModuleNotFoundError):  # proceeded past the guard
+        pk.run(audio, out)

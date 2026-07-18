@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
+
+import pytest
 
 import modular_transcriptor.mms_ctc_pass as mms
+from modular_transcriptor import cache
 
 
 def test_decode_frames_drops_pad_and_dups():
@@ -43,7 +48,25 @@ def test_decode_respects_core_window():
     assert [c["char"] for c in chars] == ["j"]
 
 
-def test_run_idempotent(tmp_path):
+def test_run_skips_when_output_fresh(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"AUDIO")
     out = tmp_path / "mms.json"
     out.write_text(json.dumps([]))
-    mms.run(tmp_path / "audio.wav", out)  # returns without importing transformers
+    cache.stamp(out, audio)
+    monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+    before = out.read_text()
+    assert mms.run(audio, out) == out
+    assert out.read_text() == before  # untouched -> genuinely skipped
+
+
+def test_run_recomputes_when_source_changed(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"AUDIO")
+    out = tmp_path / "mms.json"
+    out.write_text(json.dumps([]))
+    cache.stamp(out, audio)
+    audio.write_bytes(b"RE-EXTRACTED-DIFFERENT")  # WAV changed -> stale
+    monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+    with pytest.raises(ImportError):  # proceeded past the guard into heavy imports
+        mms.run(audio, out)
