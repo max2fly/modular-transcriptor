@@ -63,6 +63,16 @@ def test_clear_removes_sidecar(tmp_path):
     cache.clear(out)  # idempotent, no raise
 
 
+def test_extra_key_differentiates_freshness(tmp_path):
+    # Same source (unchanged bytes/mtime), but a different extraction parameter
+    # (audio track) must read as stale so the output is re-derived.
+    src = _mk(tmp_path / "s")
+    out = _mk(tmp_path / "o", b"wav")
+    cache.stamp(out, src, extra={"track": 0})
+    assert cache.is_fresh(out, src, extra={"track": 0}) is True
+    assert cache.is_fresh(out, src, extra={"track": 1}) is False
+
+
 def test_read_sidecar_corrupt_returns_none(tmp_path):
     out = _mk(tmp_path / "out.json", b"{}")
     cache.sidecar_path(out).write_text("not json{")

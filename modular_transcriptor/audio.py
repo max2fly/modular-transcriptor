@@ -10,7 +10,12 @@ log = get_logger("transcription_audio")
 
 
 def amplify_to_wav(
-    src: Path, dst: Path, *, gain_db: int = 6, timeout_s: int = 1800
+    src: Path,
+    dst: Path,
+    *,
+    gain_db: int = 6,
+    track: int | None = None,
+    timeout_s: int = 1800,
 ) -> Path:
     """Flat-gain amplification + brick-wall limiter to bring quiet speech up
     for the acoustic models WITHOUT dynamic compression (which lifts BGM /
@@ -31,8 +36,9 @@ def amplify_to_wav(
     (~0.04s each, one per ~10s segment), drifting the transcript timeline
     progressively ahead of the canonical video (measured up to ~3.7s of
     drift across a 48-min VOD)."""
+    extra = {"track": track} if track is not None else None
     if dst.exists():
-        if cache.is_fresh(dst, src):
+        if cache.is_fresh(dst, src, extra):
             log.info("amplify_reuse", dst=str(dst), src=str(src))
             return dst
         log.warning(
@@ -40,32 +46,26 @@ def amplify_to_wav(
             dst=str(dst),
             src=str(src),
             recorded=cache.read_sidecar(dst),
-            current=cache.fingerprint(src),
+            current=cache.fingerprint(src, extra),
         )
         dst.unlink()
         cache.clear(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    log.info("amplify_run", src=str(src), dst=str(dst), gain_db=gain_db)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-i",
-            str(src),
-            "-af",
-            f"volume={gain_db}dB,alimiter=limit=0.95,aresample=async=1",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(dst),
-        ],
-        check=True,
-        timeout=timeout_s,
-    )
-    cache.stamp(dst, src)
+    log.info("amplify_run", src=str(src), dst=str(dst), gain_db=gain_db, track=track)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src)]
+    if track is not None:
+        cmd += ["-map", f"0:a:{track}"]
+    cmd += [
+        "-af",
+        f"volume={gain_db}dB,alimiter=limit=0.95,aresample=async=1",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(dst),
+    ]
+    subprocess.run(cmd, check=True, timeout=timeout_s)
+    cache.stamp(dst, src, extra)
     return dst

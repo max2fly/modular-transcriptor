@@ -15,14 +15,16 @@ def _p(work: Path, name: str) -> Path:
     return work / name
 
 
-def _stage_amplify(work, audio, emit):
+def _stage_amplify(work, audio, emit, track=None):
     from modular_transcriptor.audio import amplify_to_wav
 
     # ffmpeg runs as one blocking call with no incremental progress, so emit a
     # single indeterminate label up front (otherwise the infobox shows nothing
     # for the minutes-long amplification of a full VOD).
     emit("amplifying audio", None)
-    amplify_to_wav(Path(audio), _p(work, "audio.amplified.wav"), gain_db=6)
+    amplify_to_wav(
+        Path(audio), _p(work, "audio.amplified.wav"), gain_db=6, track=track
+    )
 
 
 def _stage_parakeet(work, audio, emit):
@@ -81,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stage", required=True)
     ap.add_argument("--work", required=True, type=Path)
     ap.add_argument("--audio", required=True)
+    ap.add_argument("--audio-track", type=int, default=None)
     args = ap.parse_args(argv)
     fn_name = _STAGES.get(args.stage)
     fn = globals().get(fn_name) if fn_name is not None else None
@@ -91,7 +94,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args.work.mkdir(parents=True, exist_ok=True)
     try:
-        fn(args.work, args.audio, _emit_phase)
+        if args.stage == "amplify":
+            fn(args.work, args.audio, _emit_phase, track=args.audio_track)
+        else:
+            fn(args.work, args.audio, _emit_phase)
     except Exception as e:  # noqa: BLE001
         print(f"runner_error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return 2

@@ -30,16 +30,25 @@ def sidecar_path(out: Path) -> Path:
     return out.with_name(out.name + ".src.json")
 
 
-def fingerprint(src: Path) -> dict | None:
+def fingerprint(src: Path, extra: dict | None = None) -> dict | None:
     """Identity of `src`: size + mtime (ns). Any re-merge / re-extract rewrites
     the file (new mtime, usually new size), so this changes whenever the content
     the output was derived from changes — even a same-length re-cut. None if
-    `src` can't be stat'd."""
+    `src` can't be stat'd.
+
+    `extra` folds extraction parameters that change the OUTPUT without changing
+    the source file (e.g. which audio track is mapped) into the fingerprint, so
+    that switching only the track re-extracts. It is folded in ONLY when truthy,
+    leaving the no-extra fingerprint byte-identical to the historical two-key
+    dict."""
     try:
         st = src.stat()
-        return {"src_size": st.st_size, "src_mtime_ns": st.st_mtime_ns}
     except OSError:
         return None
+    fp = {"src_size": st.st_size, "src_mtime_ns": st.st_mtime_ns}
+    if extra:
+        fp["extra"] = extra
+    return fp
 
 
 def read_sidecar(out: Path) -> dict | None:
@@ -49,24 +58,24 @@ def read_sidecar(out: Path) -> dict | None:
         return None
 
 
-def is_fresh(out: Path, src: Path) -> bool:
+def is_fresh(out: Path, src: Path, extra: dict | None = None) -> bool:
     """True only when `out` exists and its sidecar proves it was derived from
-    the current `src` (byte-identical: same size + mtime)."""
+    the current `src` (byte-identical: same size + mtime) AND the same `extra`
+    extraction parameters. Compares the whole fingerprint dict, so a changed
+    `extra` (e.g. a different audio track) reads as stale."""
     if not out.exists():
         return False
     recorded = read_sidecar(out)
-    current = fingerprint(src)
+    current = fingerprint(src, extra)
     if recorded is None or current is None:
         return False
-    return (
-        recorded.get("src_size") == current["src_size"]
-        and recorded.get("src_mtime_ns") == current["src_mtime_ns"]
-    )
+    return recorded == current
 
 
-def stamp(out: Path, src: Path) -> None:
-    """Record the fingerprint of `src` as the provenance of `out`."""
-    fp = fingerprint(src)
+def stamp(out: Path, src: Path, extra: dict | None = None) -> None:
+    """Record the fingerprint of `src` (with `extra`) as the provenance of
+    `out`."""
+    fp = fingerprint(src, extra)
     if fp is not None:
         sidecar_path(out).write_text(json.dumps(fp))
 

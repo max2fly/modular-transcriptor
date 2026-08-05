@@ -92,6 +92,32 @@ def test_amplify_reextracts_on_size_change(monkeypatch, tmp_path):
     assert state["n"] == 2
 
 
+def test_amplify_maps_selected_track(monkeypatch, tmp_path):
+    state, fake_run = _recorder()
+    monkeypatch.setattr(audio.subprocess, "run", fake_run)
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"x")
+    dst = tmp_path / "out.wav"
+
+    audio.amplify_to_wav(src, dst, track=2)
+
+    cmd = state["cmd"]
+    i = cmd.index("-map")
+    assert cmd[i + 1] == "0:a:2"
+
+
+def test_amplify_no_track_omits_map(monkeypatch, tmp_path):
+    state, fake_run = _recorder()
+    monkeypatch.setattr(audio.subprocess, "run", fake_run)
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"x")
+    dst = tmp_path / "out.wav"
+
+    audio.amplify_to_wav(src, dst)
+
+    assert "-map" not in state["cmd"]
+
+
 def test_amplify_reextracts_when_no_sidecar(monkeypatch, tmp_path):
     # A legacy WAV extracted before the sidecar existed is unverifiable and
     # must be re-extracted (err toward caution).
