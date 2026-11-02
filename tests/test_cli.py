@@ -9,15 +9,18 @@ from modular_transcriptor import cli
 
 
 def _fake_pipeline(monkeypatch, tmp_path, diar_turns):
-    """Make _run_stage a no-op that, on the 'merge' stage, writes the outputs
-    that run_merge would, and on 'pyannote' writes diarization.json."""
+    """Make _run_stage a RECORDING fake: it appends every stage name to a list
+    (so tests can assert the exact sequence), writes diarization.json on
+    'pyannote', and writes the finalize outputs on 'finalize'."""
     inp = tmp_path / "video.mp4"
     inp.write_bytes(b"x")
+    calls: list[str] = []
 
     def fake_run_stage(stage, work, audio):
+        calls.append(stage)
         if stage == "pyannote":
             (work / "diarization.json").write_text(json.dumps(diar_turns))
-        if stage == "merge":
+        if stage == "finalize":
             (work.parent / "transcript.json").write_text(
                 json.dumps({"segments": [{"start": 1.0, "text": "hi", "speaker": "A"}]})
             )
@@ -29,11 +32,30 @@ def _fake_pipeline(monkeypatch, tmp_path, diar_turns):
     # Neutralize .env loading so a real .env in the cwd can't inject HF_TOKEN and
     # invalidate the token-precondition tests.
     monkeypatch.setattr(cli, "_load_env", lambda: None)
-    return inp
+    return inp, calls
+
+
+def test_cli_drives_expected_stage_sequence(tmp_path, monkeypatch):
+    inp, calls = _fake_pipeline(
+        monkeypatch, tmp_path, diar_turns=[{"start": 0, "end": 1, "speaker": "A"}]
+    )
+    monkeypatch.setenv("HF_TOKEN", "x")
+    out = tmp_path / "seq.json"
+    rc = cli.main([str(inp), "--out", str(out)])
+    assert rc == 0
+    assert calls == ["amplify", "parakeet", "pyannote", "finalize"]
+
+
+def test_cli_sequence_skips_pyannote_with_no_diarization(tmp_path, monkeypatch):
+    inp, calls = _fake_pipeline(monkeypatch, tmp_path, diar_turns=[])
+    out = tmp_path / "seq.json"
+    rc = cli.main([str(inp), "--no-diarization", "--out", str(out)])
+    assert rc == 0
+    assert calls == ["amplify", "parakeet", "finalize"]
 
 
 def test_cli_no_diarization_writes_outputs(tmp_path, monkeypatch):
-    inp = _fake_pipeline(monkeypatch, tmp_path, diar_turns=[])
+    inp, _ = _fake_pipeline(monkeypatch, tmp_path, diar_turns=[])
     out = tmp_path / "result.json"
     rc = cli.main([str(inp), "--no-diarization", "--out", str(out)])
     assert rc == 0
@@ -42,7 +64,7 @@ def test_cli_no_diarization_writes_outputs(tmp_path, monkeypatch):
 
 
 def test_cli_requires_hf_token_by_default(tmp_path, monkeypatch):
-    inp = _fake_pipeline(monkeypatch, tmp_path, diar_turns=[])
+    inp, _ = _fake_pipeline(monkeypatch, tmp_path, diar_turns=[])
     monkeypatch.delenv("HF_TOKEN", raising=False)
     with pytest.raises(SystemExit) as e:
         cli.main([str(inp)])
@@ -50,7 +72,9 @@ def test_cli_requires_hf_token_by_default(tmp_path, monkeypatch):
 
 
 def test_cli_errors_when_diarization_empty(tmp_path, monkeypatch):
-    inp = _fake_pipeline(monkeypatch, tmp_path, diar_turns=[])  # model produced nothing
+    inp, _ = _fake_pipeline(
+        monkeypatch, tmp_path, diar_turns=[]
+    )  # model produced nothing
     monkeypatch.setenv("HF_TOKEN", "x")
     with pytest.raises(SystemExit) as e:
         cli.main([str(inp)])
@@ -58,7 +82,7 @@ def test_cli_errors_when_diarization_empty(tmp_path, monkeypatch):
 
 
 def test_cli_diarization_success(tmp_path, monkeypatch):
-    inp = _fake_pipeline(
+    inp, _ = _fake_pipeline(
         monkeypatch, tmp_path, diar_turns=[{"start": 0, "end": 1, "speaker": "A"}]
     )
     monkeypatch.setenv("HF_TOKEN", "x")

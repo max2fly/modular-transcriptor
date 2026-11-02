@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -33,36 +32,16 @@ def _stage_parakeet(work, audio, emit):
     run(_p(work, "audio.amplified.wav"), _p(work, "parakeet.json"), phase_cb=emit)
 
 
-def _stage_mms(work, audio, emit):
-    from modular_transcriptor.mms_ctc_pass import run
-
-    run(_p(work, "audio.amplified.wav"), _p(work, "mms_ctc.json"), phase_cb=emit)
-
-
-def _stage_whisper(work, audio, emit):
-    from modular_transcriptor.whisperx_transcriber import WhisperXTranscriber
-
-    t = WhisperXTranscriber(
-        model_size=os.environ.get("WHISPER_MODEL_SIZE", "large-v3"),
-        compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "float16"),
-        batch_size=int(os.environ.get("WHISPER_BATCH_SIZE", "32")),
-        # The amplify stage already produced a 16 kHz mono WAV — no predecode.
-        predecode=False,
-    )
-    res = t.transcribe(_p(work, "audio.amplified.wav"), phase_cb=emit)
-    _p(work, "whisper.json").write_text(json.dumps(res, ensure_ascii=False))
-
-
 def _stage_pyannote(work, audio, emit):
     from modular_transcriptor.pyannote_diarize import run
 
     run(_p(work, "audio.amplified.wav"), _p(work, "diarization.json"), phase_cb=emit)
 
 
-def _stage_merge(work, audio, emit):
-    from modular_transcriptor.merge_runner import run_merge
+def _stage_finalize(work, audio, emit):
+    from modular_transcriptor.finalize import finalize_run
 
-    run_merge(work, emit)
+    finalize_run(work, emit)
 
 
 # Map stage name -> module attribute name. Resolved through the module
@@ -71,10 +50,8 @@ def _stage_merge(work, audio, emit):
 _STAGES = {
     "amplify": "_stage_amplify",
     "parakeet": "_stage_parakeet",
-    "mms": "_stage_mms",
-    "whisper": "_stage_whisper",
     "pyannote": "_stage_pyannote",
-    "merge": "_stage_merge",
+    "finalize": "_stage_finalize",
 }
 
 

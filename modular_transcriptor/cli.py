@@ -10,8 +10,8 @@ import tempfile
 from pathlib import Path
 
 # Engine stages run in order; each is a subprocess so its GPU model is freed
-# before the next loads. 'pyannote' is conditional; 'merge' always runs last.
-_PRE_MERGE_STAGES = ["amplify", "parakeet", "mms", "whisper"]
+# before the next loads. 'pyannote' is conditional; 'finalize' always runs last.
+_PRE_DIARIZE_STAGES = ["amplify", "parakeet"]
 
 
 def _load_env() -> None:
@@ -71,7 +71,7 @@ def _run_stage(stage: str, work: Path, audio: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="modular-transcriptor",
-        description="Transcribe a video/audio file (Parakeet + MMS + WhisperX merge).",
+        description="Transcribe a video/audio file (Parakeet + pyannote diarization).",
     )
     ap.add_argument("input", help="video or audio file")
     ap.add_argument(
@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     work.mkdir(parents=True, exist_ok=True)
 
     try:
-        for stage in _PRE_MERGE_STAGES:
+        for stage in _PRE_DIARIZE_STAGES:
             _run_stage(stage, work, inp)
 
         if args.no_diarization:
@@ -128,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
                     "or re-run with --no-diarization."
                 )
 
-        _run_stage("merge", work, inp)
+        _run_stage("finalize", work, inp)
 
         out_json = (
             Path(args.out).expanduser().resolve()

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "modular-transcriptor"
 version = "0.1.0"
-description = "Multi-model speech transcription (Parakeet + MMS-CTC + WhisperX merge)"
+description = "Speech transcription (Parakeet-alone ASR + pyannote diarization)"
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.1",

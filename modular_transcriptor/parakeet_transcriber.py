@@ -4,15 +4,22 @@ import gc
 import json
 from pathlib import Path
 
+from rapidfuzz import fuzz
+
 from modular_transcriptor import cache
 from modular_transcriptor._logging import get_logger
 from modular_transcriptor.types import PhaseCb
 
 log = get_logger("parakeet_transcriber")
 
-CHUNK_S = 60
-OVERLAP_S = 10
+CHUNK_S = 1800
+OVERLAP_S = 30
 MIN_DEDUP_OVERLAP_RATIO = 0.30
+# A time-overlapping segment is a true duplicate (chunk-overlap re-transcription
+# or a boundary-truncated fragment) only if its text is contained in the other's.
+# Sequential sentences that merely share a short bridge phrase score below this
+# and are both kept — otherwise real speech gets deleted (see tests).
+DEDUP_TEXT_CONTAINMENT = 90
 
 
 def run(
@@ -47,6 +54,13 @@ def run(
     model = nemo_asr.models.ASRModel.from_pretrained(model_id)
     model.eval()
     model = model.to(device)
+    # Long-form inference: switch the full-context self-attention to NeMo's
+    # limited (local) attention so a single transcribe() call can span a
+    # 30-min chunk without OOM, instead of the old hand-rolled 60s windowing
+    # that silently dropped speech at the seams.
+    model.change_attention_model(
+        "rel_pos_local_attn", att_context_size=[256, 256]
+    )
 
     chunk_samples = CHUNK_S * sr
     overlap_samples = OVERLAP_S * sr
@@ -81,7 +95,15 @@ def run(
     all_segments = _dedup_overlapping(all_segments)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".partial")
-    tmp.write_text(json.dumps({"engine": model_id, "segments": all_segments}))
+    tmp.write_text(
+        json.dumps(
+            {
+                "engine": model_id,
+                "duration_s": n_total / sr,
+                "segments": all_segments,
+            }
+        )
+    )
     tmp.replace(out_path)
     cache.stamp(out_path, audio_path)
     return out_path
@@ -95,11 +117,21 @@ def _dedup_overlapping(segs: list[dict]) -> list[dict]:
     for s in sorted_segs[1:]:
         prev = kept[-1]
         overlap = min(prev["end"], s["end"]) - max(prev["start"], s["start"])
+        if overlap <= 0:
+            kept.append(s)
+            continue
         shorter_span = max(
             1e-3, min(prev["end"] - prev["start"], s["end"] - s["start"])
         )
         ratio = overlap / shorter_span
-        if overlap > 0 and ratio >= MIN_DEDUP_OVERLAP_RATIO:
+        shorter, longer = (
+            (s, prev) if len(s["text"]) <= len(prev["text"]) else (prev, s)
+        )
+        contained = (
+            fuzz.partial_ratio(shorter["text"].lower(), longer["text"].lower())
+            >= DEDUP_TEXT_CONTAINMENT
+        )
+        if ratio >= MIN_DEDUP_OVERLAP_RATIO and contained:
             if len(s["text"]) > len(prev["text"]):
                 kept[-1] = s
             continue
