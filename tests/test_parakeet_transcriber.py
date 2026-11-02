@@ -52,6 +52,29 @@ def test_dedup_keeps_sequential_segments_sharing_a_bridge_phrase():
     assert len(out) == 2
 
 
+def test_dedup_merges_divergent_seam_duplicate_keeping_complete():
+    # A 300s chunk boundary splits one utterance: chunk A (central) gets the
+    # complete sentence, chunk B (boundary-truncated) re-transcribes the shared
+    # tail and garbles its last word. They overlap ~97% in time but the texts
+    # DIVERGE, so the containment gate would miss them. Heavy time-overlap must
+    # collapse them to the longer, complete one.
+    segs = [
+        {
+            "start": 17279.44,
+            "end": 17282.88,
+            "text": "They're very tiny but very cute, and you can build your own Shamdo.",
+        },
+        {
+            "start": 17280.48,
+            "end": 17282.96,
+            "text": "but very cute and you can build your own Sheptur.",
+        },
+    ]
+    out = pk._dedup_overlapping(segs)
+    assert len(out) == 1
+    assert out[0]["text"].startswith("They're very tiny")  # complete one kept
+
+
 def test_dedup_keeps_stutter_repeat_of_identical_sentence():
     # A streamer stutters the same sentence back-to-back: identical text but
     # DISJOINT time. These are two real utterances, not a re-transcription, so
@@ -81,19 +104,23 @@ def test_convert_to_canonical_offsets_times():
     assert segs[0]["language"] == "en"
 
 
-def test_chunk_constants_are_longform():
-    assert pk.CHUNK_S == 1800 and pk.OVERLAP_S == 30
+def test_chunk_constants():
+    # Speech-aware chunking targets ~40 s (the model's PnC training max; longer
+    # chunks collapse punctuation into one run-on), cut at pauses with a small
+    # overlap so no boundary word is dropped.
+    assert pk.TARGET_CHUNK_S < pk.CHUNK_HARD_MAX_S
+    assert pk.MIN_CHUNK_S < pk.TARGET_CHUNK_S
+    assert pk.TARGET_CHUNK_S == 40
+    assert pk.CHUNK_OVERLAP_S == 0  # cut in the pause midpoint -> contiguous
 
 
-def test_run_enables_local_attention(monkeypatch, tmp_path):
+def test_run_uses_full_context_attention(monkeypatch, tmp_path):
     # Drive run() end-to-end against fakes (no GPU / no model download) and
-    # capture the change_attention_model args. A 3s clip yields a single
-    # 30-min chunk; the existing n_chunks formula already covers the tail, so
-    # even a 15h stream needs no new loop code.
+    # assert it NEVER switches the model to local attention: the 300 s chunks
+    # decode with the model's native full-context attention. A 3s clip yields a
+    # single chunk; the existing n_chunks formula already covers the tail.
     import torch
     import torchaudio
-
-    calls = {}
 
     class FakeModel:
         def eval(self):
@@ -102,8 +129,10 @@ def test_run_enables_local_attention(monkeypatch, tmp_path):
         def to(self, d):
             return self
 
-        def change_attention_model(self, self_attention_model, att_context_size):
-            calls["attn"] = (self_attention_model, att_context_size)
+        def change_attention_model(self, *a, **k):
+            raise AssertionError(
+                "run() must not switch attention — full-context decode only"
+            )
 
         def transcribe(self, clips, timestamps, verbose):
             class H:
@@ -131,8 +160,9 @@ def test_run_enables_local_attention(monkeypatch, tmp_path):
     )
 
     out = tmp_path / "out.json"
+    # The FakeModel raises if change_attention_model is ever called, so a clean
+    # run() is itself the proof that full-context decode is used.
     pk.run(tmp_path / "a.wav", out)
-    assert calls["attn"] == ("rel_pos_local_attn", [256, 256])
     written = json.loads(out.read_text())
     assert written["duration_s"] == pytest.approx(3.0)
 
@@ -142,7 +172,10 @@ def test_run_skips_when_output_fresh(tmp_path, monkeypatch):
     audio.write_bytes(b"AUDIO")
     out = tmp_path / "parakeet.json"
     out.write_text(json.dumps({"engine": "x", "segments": []}))
-    cache.stamp(out, audio)
+    # Stamp with the SAME keyed extra run() computes for its default (no-boost)
+    # path: parakeet_cache_extra normalizes alpha to 0.0 when boost_file is None,
+    # so run()'s is_fresh(..., extra=parakeet_cache_extra(None, 4.0)) must hit.
+    cache.stamp(out, audio, extra=pk.parakeet_cache_extra(None, 4.0))
     # If it wrongly proceeds, this poisoned import fails fast (no model load).
     monkeypatch.setitem(sys.modules, "nemo", types.ModuleType("nemo"))
     before = out.read_text()

@@ -53,13 +53,62 @@ def test_lean_schema_and_source(tmp_path):
     assert seg["source"] == "parakeet" and seg["kind"] == "speech"
     assert seg["speaker"] is None and out["diarized"] is False
     assert out["model"] == MODEL_NAME
-    assert out["model"] == "parakeet-tdt-0.6b-v3 (local-attn)"
+    assert out["model"] == "parakeet-tdt-0.6b-v3"  # stale "(local-attn)" dropped
     assert out["produced_by_version"] == PRODUCED_BY_VERSION == "0.4.0"
     assert out["language"] == "en" and out["compute_type"] == "float16"
     assert out["duration_s"] == pytest.approx(seg["end"])
     word = seg["words"][0]
     assert set(word) >= {"start", "end", "word"}
     assert "score" not in word
+
+
+def test_long_unpunctuated_segment_is_resegmented_at_pauses(tmp_path):
+    # A chunk that collapsed into one 40s unpunctuated run-on. Words carry
+    # timestamps with clear pauses; finalize must split it into caption-sized
+    # pieces (<= RESEG_MAX_S) broken at those pauses.
+    words = []
+    t = 0.0
+    for i in range(40):
+        words.append({"word": f"w{i}", "start": t, "end": t + 0.4, "score": 1.0})
+        # insert a 0.8s pause every 8 words
+        t += 0.4 + (0.8 if (i + 1) % 8 == 0 else 0.1)
+    seg = [
+        {
+            "start": 0.0,
+            "end": words[-1]["end"],
+            "text": " ".join(w["word"] for w in words),  # no punctuation
+            "words": words,
+        }
+    ]
+    work = tmp_path / "work"
+    _write_parakeet(work, seg)
+    finalize_run(work)
+    out = json.loads((tmp_path / "transcript.json").read_text())
+    segs = out["segments"]
+    assert len(segs) > 1  # the run-on got split
+    assert all((s["end"] - s["start"]) <= 12.0 + 1e-6 for s in segs)
+    # coverage preserved: first start and last end unchanged
+    assert segs[0]["start"] == 0.0
+    assert segs[-1]["end"] == pytest.approx(words[-1]["end"])
+
+
+def test_abbreviation_split_is_merged(tmp_path):
+    # Parakeet splits after "Dr." (trailing period); captions must re-merge it.
+    segs = [
+        {"start": 0.0, "end": 2.0, "text": "I am a surgeon, Dr.",
+         "words": [{"word": "Dr.", "start": 1.8, "end": 2.0, "score": 1.0}]},
+        {"start": 2.1, "end": 2.6, "text": "Hun!",
+         "words": [{"word": "Hun!", "start": 2.1, "end": 2.6, "score": 1.0}]},
+        {"start": 3.0, "end": 4.0, "text": "Okay.",
+         "words": [{"word": "Okay.", "start": 3.0, "end": 4.0, "score": 1.0}]},
+    ]
+    work = tmp_path / "work"
+    _write_parakeet(work, segs)
+    finalize_run(work)
+    out = json.loads((tmp_path / "transcript.json").read_text())["segments"]
+    assert out[0]["text"] == "I am a surgeon, Dr. Hun!"  # merged
+    assert out[0]["end"] == pytest.approx(2.6)
+    assert out[1]["text"] == "Okay."  # non-abbrev segment untouched
 
 
 def test_duration_s_uses_parakeet_value_when_present(tmp_path):

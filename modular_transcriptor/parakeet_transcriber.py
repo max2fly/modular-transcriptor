@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 from pathlib import Path
 
@@ -12,14 +13,205 @@ from modular_transcriptor.types import PhaseCb
 
 log = get_logger("parakeet_transcriber")
 
-CHUNK_S = 1800
-OVERLAP_S = 30
+# Speech-aware chunking. The model's punctuation+capitalization head was trained
+# on sequences <=40s and its accuracy plateaus/collapses beyond that (see
+# "Longer is (Not Necessarily) Stronger", arXiv:2409.05601). So we aim for ~40s
+# chunks but ALWAYS cut in a pause, never mid-utterance/mid-verse: around the
+# target we cut at the quietest frame if it is a genuine pause; otherwise (e.g.
+# continuous singing) we extend forward to the next real pause. A chunk only
+# ever exceeds the target when there's no pause to cut on, and never exceeds the
+# 5-minute safety cap. Normal speech pauses often, so it still chunks ~40s and
+# keeps punctuation healthy; long no-pause runs stay whole (and are split into
+# captions downstream in finalize).
+TARGET_CHUNK_S = 40  # preferred chunk length (== PnC training max)
+CHUNK_HARD_MAX_S = 300  # 5-minute safety net: force a cut if no pause is found
+MIN_CHUNK_S = 15  # never cut a chunk shorter than this
+CHUNK_SEARCH_S = 12  # search +/- this around the target for a pause
+CHUNK_OVERLAP_S = 0  # emit regions are contiguous (cut at the pause midpoint)
+_SILENCE_FRAME_S = 0.03  # 30ms RMS frames for the silence envelope
+# A frame counts as a "pause" if its RMS is at/below this fraction of the LOCAL
+# speech level (75th percentile of the ~next 2*target seconds of frame energy).
+# Local + percentile, not global or median: a global threshold misses pauses in
+# loud passages, and a median-based one fails in silence-dominated passages
+# (median == silence, so a fraction of it lands below the gaps).
+_PAUSE_FRACTION = 0.35
+# A cut only lands in a SUSTAINED pause (>= this long) — a brief intra-word
+# energy dip is shorter and must not be mistaken for a gap (that split
+# "accident" -> "...an ice" at a boundary). We cut at the pause's midpoint.
+_MIN_PAUSE_S = 0.12
 MIN_DEDUP_OVERLAP_RATIO = 0.30
 # A time-overlapping segment is a true duplicate (chunk-overlap re-transcription
 # or a boundary-truncated fragment) only if its text is contained in the other's.
 # Sequential sentences that merely share a short bridge phrase score below this
 # and are both kept — otherwise real speech gets deleted (see tests).
 DEDUP_TEXT_CONTAINMENT = 90
+# Above this time-overlap ratio, two segments cover essentially the SAME audio
+# (a chunk-seam re-transcription), so they are duplicates even when their text
+# diverges — a boundary-truncated chunk garbles the shared utterance's edge
+# (e.g. "...build your own Shamdo" vs a truncated "...build your own Sheptur").
+# We then keep the longer (more complete) one. Sequential distinct sentences
+# overlap far less than this, so they are unaffected.
+HIGH_OVERLAP_RATIO = 0.5
+
+
+def speech_aware_bounds(audio, sr: int) -> list[tuple[int, int]]:
+    """Sample-index (start, end) chunk pairs cut at PAUSES, not fixed offsets.
+
+    Builds a coarse RMS envelope and, around each target boundary
+    (``start + TARGET_CHUNK_S``), cuts at the MIDPOINT of the nearest SUSTAINED
+    pause (a run of >= ``_MIN_PAUSE_S`` of frames at/below the per-clip
+    local ``_PAUSE_FRACTION`` of nearby energy) — so a cut never splits a word on a brief intra-word
+    dip. If no sustained pause is near the target (e.g. continuous singing), it
+    scans FORWARD for the next one rather than cutting mid-verse — bounded by
+    the 5-minute ``CHUNK_HARD_MAX_S`` safety cap. Because the cut sits in the
+    MIDDLE of a real pause, chunks are contiguous (``CHUNK_OVERLAP_S`` = 0): an
+    overlap would re-enter the previous utterance, re-transcribing (and often
+    mis-hearing) its tail and starting the next chunk mid-phrase — which both
+    duplicated words and degraded that chunk's punctuation.
+    `numpy` is imported by the caller (`run`); `audio` is a 1-D float32 array.
+    """
+    import numpy as np  # type: ignore[import-not-found]
+
+    n = int(len(audio))
+    if n == 0:
+        return []
+    frame = max(1, int(_SILENCE_FRAME_S * sr))
+    nf = n // frame
+    if nf < 2:
+        return [(0, n)]
+    rms = np.sqrt(
+        (audio[: nf * frame].reshape(nf, frame).astype(np.float64) ** 2).mean(axis=1)
+        + 1e-12
+    )
+    min_pause = max(1, int(_MIN_PAUSE_S / _SILENCE_FRAME_S))  # frames of real gap
+
+    def _runs(f_lo: int, f_hi: int, thr: float):
+        """Yield the mid-frame of each sustained run (>= min_pause) of frames at
+        or below ``thr`` in [f_lo, f_hi), so a cut lands in the MIDDLE of a
+        genuine pause (never a one-frame intra-word dip that splits a word)."""
+        i = f_lo
+        while i < f_hi:
+            if rms[i] <= thr:
+                j = i
+                while j < f_hi and rms[j] <= thr:
+                    j += 1
+                if j - i >= min_pause:
+                    yield (i + j) // 2
+                i = j
+            else:
+                i += 1
+
+    target = int(TARGET_CHUNK_S * sr)
+    mn = int(MIN_CHUNK_S * sr)
+    search = int(CHUNK_SEARCH_S * sr)
+    hard = int(CHUNK_HARD_MAX_S * sr)
+    overlap = int(CHUNK_OVERLAP_S * sr)
+    ref_frames = (2 * target) // frame  # local window for the adaptive threshold
+
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    while start < n:
+        if n - start <= target + search:
+            bounds.append((start, n))
+            break
+        # LOCAL pause threshold: a fraction of the SPEECH level just ahead,
+        # estimated as a high percentile of local frame energy. Keyed to the
+        # local speech level (not the whole clip, and not the median): a global
+        # threshold misses pauses in loud passages, and a median-based one fails
+        # in silence-dominated passages (the median IS the silence, so a
+        # fraction of it falls below the real gaps). The high percentile tracks
+        # how loud the speech is, so gaps reliably fall below the threshold.
+        sf = start // frame
+        local = float(np.percentile(rms[sf : min(nf, sf + ref_frames)], 75))
+        thr = max(1e-6, _PAUSE_FRACTION * local)
+        tgt_f = (start + target) // frame
+        lo_f = max((start + mn) // frame, (start + target - search) // frame)
+        hi_f = min(nf, (start + target + search) // frame)
+        cands = list(_runs(lo_f, hi_f, thr))
+        if cands:
+            cut_frame = min(cands, key=lambda m: abs(m - tgt_f))
+        else:
+            # no pause near target (continuous singing): extend forward to the
+            # next pause, up to the 5-min safety cap.
+            scan_hi = min(nf, (start + hard) // frame)
+            cut_frame = next(_runs(hi_f, scan_hi, thr), scan_hi)
+        cut = min(max(cut_frame * frame, start + mn), n)
+        bounds.append((start, cut))
+        if cut >= n:
+            break
+        start = max(cut - overlap, start + 1)
+    return bounds
+
+
+def parakeet_cache_extra(
+    boost_file: Path | None,
+    boost_alpha: float,
+    context_score: float = 0.3,
+    depth_scaling: float = 4.0,
+) -> dict:
+    """Cache-key `extra` for the parakeet pass.
+
+    Folds the chunking geometry and the boost parameters into the freshness
+    fingerprint so that changing the chunk size, the boost word list, the boost
+    strength, or the gentleness knobs invalidates a stale `parakeet.json`.
+    `boost_sha` is the sha256 hex of the boost file's bytes (None when no boost
+    file)."""
+    boost_sha: str | None = None
+    if boost_file is not None:
+        boost_sha = hashlib.sha256(Path(boost_file).read_bytes()).hexdigest()
+    else:
+        # All boost params are inert without a boost file, so normalize them out
+        # of the key: an un-boosted parakeet.json must not re-invalidate when a
+        # boost default changes.
+        boost_alpha = 0.0
+        context_score = 0.0
+        depth_scaling = 0.0
+    return {
+        "target_chunk_s": TARGET_CHUNK_S,
+        "hard_max_chunk_s": CHUNK_HARD_MAX_S,
+        "boost_sha": boost_sha,
+        "boost_alpha": boost_alpha,
+        "boost_context_score": context_score,
+        "boost_depth_scaling": depth_scaling,
+    }
+
+
+def build_decoding_cfg(
+    boost_file: Path | None,
+    boost_alpha: float,
+    context_score: float = 0.3,
+    depth_scaling: float = 4.0,
+) -> dict | None:
+    """Greedy-batch RNNT decoding config enabling NeMo context biasing.
+
+    Returns a plain dict shaped for ``model.change_decoding_strategy`` (merged
+    onto the model's own ``cfg.decoding`` in ``run``), or ``None`` when biasing
+    is disabled (no boost file, or non-positive alpha) so callers decode
+    unchanged.
+
+    The boosting-tree lives under ``greedy`` because NeMo's TDT/RNNT greedy-batch
+    decoder reads ``boosting_tree`` / ``boosting_tree_alpha`` from the
+    ``GreedyBatchedRNNTInferConfig`` at ``decoding.greedy``.
+
+    ``context_score`` is the per-arc push on each boosted token (lower = gentler,
+    less likely to override a confident acoustic decision) and ``depth_scaling``
+    rewards deeper/longer phrase matches (higher = favor multi-token names over
+    single near-homophone tokens). Together they let the boost break ties for
+    real phrases without force-injecting single tokens; both are tuned on the
+    full stream."""
+    if boost_file is None or boost_alpha <= 0:
+        return None
+    return {
+        "strategy": "greedy_batch",
+        "greedy": {
+            "boosting_tree": {
+                "key_phrases_file": str(boost_file),
+                "context_score": context_score,
+                "depth_scaling": depth_scaling,
+            },
+            "boosting_tree_alpha": boost_alpha,
+        },
+    }
 
 
 def run(
@@ -29,8 +221,28 @@ def run(
     model_id: str = "nvidia/parakeet-tdt-0.6b-v3",
     device: str = "cuda",
     phase_cb: PhaseCb | None = None,
+    boost_file: Path | None = None,
+    # Chosen by the GPU alpha sweep on 317640725476 (task-C2 Step 5): 2.0
+    # recovers near-homophone names (Shonda->Shondo, Horgan->Hargan) with zero
+    # collateral, while higher values violate the plausibility rule (alpha 4.0+
+    # forces "medical"->garbled "MITACLEMARK" and corrupts neighbors).
+    boost_alpha: float = 2.0,
+    # Gentleness knobs chosen by the full-stream knob sweep on 317640725476:
+    # low context_score (per-token push) + high depth_scaling makes the boost
+    # BREAK TIES for genuine multi-token phrases without force-injecting single
+    # near-homophone tokens. This cut near-homophone stealing 11->1 and garbage
+    # 78->50 (==unboosted) at the highest fidelity to the unboosted transcript
+    # (0.978), i.e. it only changes the transcript where it is confident.
+    boost_context_score: float = 0.3,
+    boost_depth_scaling: float = 4.0,
 ) -> Path:
-    if cache.is_fresh(out_path, audio_path):
+    if cache.is_fresh(
+        out_path,
+        audio_path,
+        extra=parakeet_cache_extra(
+            boost_file, boost_alpha, boost_context_score, boost_depth_scaling
+        ),
+    ):
         log.info("parakeet_skip_fresh", out=str(out_path))
         return out_path
 
@@ -42,6 +254,7 @@ def run(
     import numpy as np  # type: ignore[import-not-found]
     import torch  # type: ignore[import-not-found]
     import torchaudio  # type: ignore[import-not-found]
+    from omegaconf import OmegaConf, open_dict  # type: ignore[import-not-found]
 
     emit("loading audio", 2.0)
     waveform, sr = torchaudio.load(str(audio_path))
@@ -54,24 +267,54 @@ def run(
     model = nemo_asr.models.ASRModel.from_pretrained(model_id)
     model.eval()
     model = model.to(device)
-    # Long-form inference: switch the full-context self-attention to NeMo's
-    # limited (local) attention so a single transcribe() call can span a
-    # 30-min chunk without OOM, instead of the old hand-rolled 60s windowing
-    # that silently dropped speech at the seams.
-    model.change_attention_model(
-        "rel_pos_local_attn", att_context_size=[256, 256]
-    )
 
-    chunk_samples = CHUNK_S * sr
-    overlap_samples = OVERLAP_S * sr
-    step = chunk_samples - overlap_samples
+    boost_cfg = build_decoding_cfg(
+        boost_file, boost_alpha, boost_context_score, boost_depth_scaling
+    )
+    if boost_cfg is not None:
+        # Merge the greedy-batch boosting fields onto the model's OWN decoding
+        # cfg (preserving every other default) and re-install it. The model
+        # exposes its active decoding config at ``cfg.decoding``.
+        decoding_cfg = OmegaConf.create(OmegaConf.to_container(model.cfg.decoding))
+        with open_dict(decoding_cfg):
+            OmegaConf.update(decoding_cfg, "strategy", boost_cfg["strategy"])
+            OmegaConf.update(
+                decoding_cfg,
+                "greedy.boosting_tree.key_phrases_file",
+                boost_cfg["greedy"]["boosting_tree"]["key_phrases_file"],
+                force_add=True,
+            )
+            OmegaConf.update(
+                decoding_cfg,
+                "greedy.boosting_tree.context_score",
+                boost_cfg["greedy"]["boosting_tree"]["context_score"],
+                force_add=True,
+            )
+            OmegaConf.update(
+                decoding_cfg,
+                "greedy.boosting_tree.depth_scaling",
+                boost_cfg["greedy"]["boosting_tree"]["depth_scaling"],
+                force_add=True,
+            )
+            OmegaConf.update(
+                decoding_cfg,
+                "greedy.boosting_tree_alpha",
+                boost_cfg["greedy"]["boosting_tree_alpha"],
+                force_add=True,
+            )
+        model.change_decoding_strategy(decoding_cfg)
+        log.info(
+            "parakeet_biasing_enabled",
+            boost_file=str(boost_file),
+            boost_alpha=boost_alpha,
+        )
+
     n_total = audio_np.shape[0]
-    n_chunks = max(1, (n_total - overlap_samples + step - 1) // step)
+    bounds = speech_aware_bounds(audio_np, sr)
+    n_chunks = len(bounds)
 
     all_segments: list[dict] = []
-    for ci in range(n_chunks):
-        chunk_start_sample = ci * step
-        chunk_end_sample = min(chunk_start_sample + chunk_samples, n_total)
+    for ci, (chunk_start_sample, chunk_end_sample) in enumerate(bounds):
         clip = audio_np[chunk_start_sample:chunk_end_sample]
         if clip.shape[0] < 1600:
             continue
@@ -105,7 +348,11 @@ def run(
         )
     )
     tmp.replace(out_path)
-    cache.stamp(out_path, audio_path)
+    cache.stamp(
+        out_path, audio_path, extra=parakeet_cache_extra(
+            boost_file, boost_alpha, boost_context_score, boost_depth_scaling
+        ),
+    )
     return out_path
 
 
@@ -124,6 +371,13 @@ def _dedup_overlapping(segs: list[dict]) -> list[dict]:
             1e-3, min(prev["end"] - prev["start"], s["end"] - s["start"])
         )
         ratio = overlap / shorter_span
+        # Heavy time-overlap => same utterance transcribed twice at a chunk
+        # seam. Keep the longer (more complete) one even if the boundary-
+        # truncated copy garbled the edge and the texts diverge.
+        if ratio >= HIGH_OVERLAP_RATIO:
+            if len(s["text"]) > len(prev["text"]):
+                kept[-1] = s
+            continue
         shorter, longer = (
             (s, prev) if len(s["text"]) <= len(prev["text"]) else (prev, s)
         )

@@ -8,7 +8,9 @@ def test_dispatch_calls_parakeet(monkeypatch, tmp_path):
     monkeypatch.setattr(
         r,
         "_stage_parakeet",
-        lambda work, audio, emit: called.setdefault("p", (work, audio)),
+        lambda work, audio, emit, boost_file=None, boost_alpha=None: called.setdefault(
+            "p", (work, audio, boost_file, boost_alpha)
+        ),
     )
     rc = r.main(
         [

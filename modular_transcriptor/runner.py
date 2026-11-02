@@ -26,10 +26,15 @@ def _stage_amplify(work, audio, emit, track=None):
     )
 
 
-def _stage_parakeet(work, audio, emit):
+def _stage_parakeet(work, audio, emit, boost_file=None, boost_alpha=None):
     from modular_transcriptor.parakeet_transcriber import run
 
-    run(_p(work, "audio.amplified.wav"), _p(work, "parakeet.json"), phase_cb=emit)
+    # boost_alpha is forwarded only when explicitly set so run()'s own default
+    # stays authoritative (avoids pinning a value the CLI didn't ask for).
+    kwargs = {"phase_cb": emit, "boost_file": boost_file}
+    if boost_alpha is not None:
+        kwargs["boost_alpha"] = boost_alpha
+    run(_p(work, "audio.amplified.wav"), _p(work, "parakeet.json"), **kwargs)
 
 
 def _stage_pyannote(work, audio, emit):
@@ -55,12 +60,22 @@ _STAGES = {
 }
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_argparser() -> argparse.ArgumentParser:
+    """Construct the runner's CLI parser. Split out of main() so the argument
+    surface (including --boost-file/--boost-alpha) is unit-testable without
+    spawning a subprocess."""
     ap = argparse.ArgumentParser(prog="modular_transcriptor.runner")
     ap.add_argument("--stage", required=True)
     ap.add_argument("--work", required=True, type=Path)
     ap.add_argument("--audio", required=True)
     ap.add_argument("--audio-track", type=int, default=None)
+    ap.add_argument("--boost-file", type=Path, default=None)
+    ap.add_argument("--boost-alpha", type=float, default=None)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_argparser()
     args = ap.parse_args(argv)
     fn_name = _STAGES.get(args.stage)
     fn = globals().get(fn_name) if fn_name is not None else None
@@ -73,6 +88,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.stage == "amplify":
             fn(args.work, args.audio, _emit_phase, track=args.audio_track)
+        elif args.stage == "parakeet":
+            fn(
+                args.work,
+                args.audio,
+                _emit_phase,
+                boost_file=args.boost_file,
+                boost_alpha=args.boost_alpha,
+            )
         else:
             fn(args.work, args.audio, _emit_phase)
     except Exception as e:  # noqa: BLE001
