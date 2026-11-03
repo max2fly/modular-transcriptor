@@ -53,6 +53,15 @@ DEDUP_TEXT_CONTAINMENT = 90
 # overlap far less than this, so they are unaffected.
 HIGH_OVERLAP_RATIO = 0.5
 
+# Hole-repair (second pass). A span with speech-level energy but NO decoded word
+# is usually a cold-start drop (a chunk dropped its own opening). We re-decode it
+# as a window centered on the hole (speech now mid-clip / warm) and merge back
+# any recovered words. Non-speech holes (music/laughter) recover nothing — the
+# model self-gates — so no extra gate is needed.
+REPAIR_MIN_HOLE_S = 2.5    # ignore gaps shorter than this
+REPAIR_CTX_S = 12.0        # context each side of the hole in the re-decode window
+REPAIR_RMS_SPEECH = 0.05   # 0.25s-frame RMS above this counts as speech-ish
+
 
 def speech_aware_bounds(audio, sr: int) -> list[tuple[int, int]]:
     """Sample-index (start, end) chunk pairs cut at PAUSES, not fixed offsets.
@@ -271,43 +280,83 @@ def run(
     boost_cfg = build_decoding_cfg(
         boost_file, boost_alpha, boost_context_score, boost_depth_scaling
     )
+    # Install the decoding strategy via a helper so a chunk that trips NeMo's
+    # fragile word-confidence boundary reconstruction (a hard RuntimeError on a
+    # token-vs-word off-by-one, seen around contractions/apostrophes) can be
+    # re-decoded WITHOUT confidence rather than killing the whole transcription.
+    # with_confidence=True turns on per-word confidence -> each word's `score`
+    # (a debug signal that flags low-confidence / likely-wrong words near zero);
+    # boosting rides the same greedy_batch strategy and is always applied.
+    # Snapshot the model's PRISTINE decoding cfg once. Every install rebuilds
+    # from this, so a with_confidence=False install genuinely drops confidence —
+    # rebuilding from the live model.cfg.decoding would re-read the confidence
+    # already installed, and the fallback decode would crash all over again.
+    _base_decoding = OmegaConf.to_container(model.cfg.decoding)
+
+    def _install_decoding(with_confidence: bool) -> None:
+        cfg = OmegaConf.create(_base_decoding)
+        with open_dict(cfg):
+            if with_confidence:
+                OmegaConf.update(
+                    cfg, "confidence_cfg.preserve_frame_confidence", True, force_add=True
+                )
+                OmegaConf.update(
+                    cfg, "confidence_cfg.preserve_token_confidence", True, force_add=True
+                )
+                OmegaConf.update(
+                    cfg, "confidence_cfg.preserve_word_confidence", True, force_add=True
+                )
+                # min over a word's sub-tokens: the weakest token sets the score.
+                OmegaConf.update(
+                    cfg, "confidence_cfg.aggregation", "min", force_add=True
+                )
+            if boost_cfg is not None:
+                OmegaConf.update(cfg, "strategy", boost_cfg["strategy"])
+                OmegaConf.update(
+                    cfg, "greedy.boosting_tree.key_phrases_file",
+                    boost_cfg["greedy"]["boosting_tree"]["key_phrases_file"],
+                    force_add=True,
+                )
+                OmegaConf.update(
+                    cfg, "greedy.boosting_tree.context_score",
+                    boost_cfg["greedy"]["boosting_tree"]["context_score"],
+                    force_add=True,
+                )
+                OmegaConf.update(
+                    cfg, "greedy.boosting_tree.depth_scaling",
+                    boost_cfg["greedy"]["boosting_tree"]["depth_scaling"],
+                    force_add=True,
+                )
+                OmegaConf.update(
+                    cfg, "greedy.boosting_tree_alpha",
+                    boost_cfg["greedy"]["boosting_tree_alpha"], force_add=True,
+                )
+        model.change_decoding_strategy(cfg)
+
+    _install_decoding(with_confidence=True)
     if boost_cfg is not None:
-        # Merge the greedy-batch boosting fields onto the model's OWN decoding
-        # cfg (preserving every other default) and re-install it. The model
-        # exposes its active decoding config at ``cfg.decoding``.
-        decoding_cfg = OmegaConf.create(OmegaConf.to_container(model.cfg.decoding))
-        with open_dict(decoding_cfg):
-            OmegaConf.update(decoding_cfg, "strategy", boost_cfg["strategy"])
-            OmegaConf.update(
-                decoding_cfg,
-                "greedy.boosting_tree.key_phrases_file",
-                boost_cfg["greedy"]["boosting_tree"]["key_phrases_file"],
-                force_add=True,
-            )
-            OmegaConf.update(
-                decoding_cfg,
-                "greedy.boosting_tree.context_score",
-                boost_cfg["greedy"]["boosting_tree"]["context_score"],
-                force_add=True,
-            )
-            OmegaConf.update(
-                decoding_cfg,
-                "greedy.boosting_tree.depth_scaling",
-                boost_cfg["greedy"]["boosting_tree"]["depth_scaling"],
-                force_add=True,
-            )
-            OmegaConf.update(
-                decoding_cfg,
-                "greedy.boosting_tree_alpha",
-                boost_cfg["greedy"]["boosting_tree_alpha"],
-                force_add=True,
-            )
-        model.change_decoding_strategy(decoding_cfg)
         log.info(
             "parakeet_biasing_enabled",
             boost_file=str(boost_file),
             boost_alpha=boost_alpha,
         )
+
+    def _transcribe_clip(clip):
+        """Decode one clip, surviving NeMo's fragile word-confidence boundary
+        reconstruction (hard RuntimeError on a token/word off-by-one) by
+        re-decoding WITHOUT confidence, then re-arming. Shared by the main chunk
+        loop and the hole-repair pass."""
+        try:
+            return model.transcribe([clip], timestamps=True, verbose=False)[0]
+        except RuntimeError as e:
+            if "confidence" not in str(e).lower():
+                raise
+            log.warning("parakeet_word_confidence_fallback", err=str(e))
+            _install_decoding(with_confidence=False)
+            try:
+                return model.transcribe([clip], timestamps=True, verbose=False)[0]
+            finally:
+                _install_decoding(with_confidence=True)
 
     n_total = audio_np.shape[0]
     bounds = speech_aware_bounds(audio_np, sr)
@@ -319,14 +368,24 @@ def run(
         if clip.shape[0] < 1600:
             continue
         chunk_start_s = chunk_start_sample / sr
-        hyps = model.transcribe([clip], timestamps=True, verbose=False)
-        all_segments.extend(_convert_to_canonical(hyps[0], time_offset=chunk_start_s))
+        hyp = _transcribe_clip(clip)
+        all_segments.extend(_convert_to_canonical(hyp, time_offset=chunk_start_s))
         emit("transcribing", 6.0 + 90.0 * (ci + 1) / n_chunks)
         # NB: do NOT call torch.cuda.empty_cache() inside this loop — NeMo's
         # TDT decoder retains references to internal buffers between
         # transcribe() calls; emptying the allocator frees memory the decoder
         # still points at -> "CUDA error: illegal memory access" after enough
         # successive calls (observed at chunk 270/270).
+
+    all_segments = _dedup_overlapping(all_segments)
+    # Second pass: repair cold-start DROPS. A chunk occasionally drops its own
+    # opening (a knife-edge TDT instability sensitive to the exact boundary
+    # sample); the dropped span then has speech-level audio energy but no words.
+    # Re-decode each such hole as a window CENTERED on it — the speech is now
+    # mid-clip (warm), not a cold start — and merge back any recovered words.
+    # Non-speech holes (music/laughter) self-gate: the model emits nothing.
+    emit("repairing dropped speech", 96.0)
+    all_segments = _repair_holes(audio_np, sr, all_segments, _transcribe_clip)
 
     try:
         del model
@@ -335,7 +394,6 @@ def run(
     except (torch.AcceleratorError, RuntimeError) as e:
         log.warning("parakeet_cleanup_ignored", err=str(e))
 
-    all_segments = _dedup_overlapping(all_segments)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".partial")
     tmp.write_text(
@@ -398,6 +456,14 @@ def _convert_to_canonical(hyp, time_offset: float = 0.0) -> list[dict]:
     seg_entries = ts.get("segment", [])
     word_entries = ts.get("word", [])
 
+    # Per-word confidence is a SEPARATE list on the hypothesis (index-aligned
+    # with word_entries), NOT a key on each word dict. None/short when decoding
+    # ran without confidence enabled -> fall back to 1.0 so score stays a float.
+    wconf = list(getattr(hyp, "word_confidence", None) or [])
+    scores = [
+        float(wconf[i]) if i < len(wconf) else 1.0 for i in range(len(word_entries))
+    ]
+
     segments: list[dict] = []
     for sent in seg_entries:
         s_start = float(sent["start"]) + time_offset
@@ -407,19 +473,92 @@ def _convert_to_canonical(hyp, time_offset: float = 0.0) -> list[dict]:
                 "word": w["word"],
                 "start": float(w["start"]) + time_offset,
                 "end": float(w["end"]) + time_offset,
-                "score": float(w.get("confidence", 1.0)),
+                "score": sc,
             }
-            for w in word_entries
+            for w, sc in zip(word_entries, scores)
             if float(sent["start"]) <= float(w["start"]) <= float(sent["end"])
         ]
+        # Segment confidence = mean of its word scores (None when wordless), a
+        # quick per-caption weakness signal for the debug views.
+        seg_scores = [x["score"] for x in words_in]
+        avg_conf = sum(seg_scores) / len(seg_scores) if seg_scores else None
         segments.append(
             {
                 "start": s_start,
                 "end": s_end,
                 "text": sent["segment"],
                 "language": "en",
-                "avg_logprob": None,
+                "avg_logprob": avg_conf,
                 "words": words_in,
             }
         )
     return segments
+
+
+def _repair_holes(audio, sr, segments, transcribe_clip):
+    """Second pass: recover cold-start DROPS. A span with speech-level energy but
+    no decoded word is re-decoded as a window CENTERED on it (so the dropped
+    speech sits mid-clip / warm, not at a cold chunk start) and any recovered
+    in-hole words are merged back. Non-speech holes (music/laughter) recover
+    nothing — the model self-gates — so no extra gate is needed.
+
+    `audio` is the 1-D float32 waveform, `transcribe_clip` decodes one clip to a
+    hypothesis. Returns the merged, de-duplicated segment list."""
+    import numpy as np  # type: ignore[import-not-found]
+
+    n = int(len(audio))
+    dur = n / sr
+    fr = max(1, int(0.25 * sr))
+    nf = n // fr
+    if nf < 2:
+        return segments
+    rms = np.sqrt(
+        (audio[: nf * fr].reshape(nf, fr).astype(np.float64) ** 2).mean(axis=1) + 1e-12
+    )
+    covered = np.zeros(nf, dtype=bool)
+    for seg in segments:
+        for w in seg.get("words") or []:
+            covered[int(w["start"] / 0.25): int(w["end"] / 0.25) + 1] = True
+    hole = (rms > REPAIR_RMS_SPEECH) & ~covered
+
+    holes: list[tuple[float, float]] = []
+    i = 0
+    while i < nf:
+        if hole[i]:
+            j = i
+            while j < nf and hole[j]:
+                j += 1
+            if (j - i) * 0.25 >= REPAIR_MIN_HOLE_S:
+                holes.append((i * 0.25, j * 0.25))
+            i = j
+        else:
+            i += 1
+    if not holes:
+        return segments
+
+    added: list[dict] = []
+    for (h0, h1) in holes:
+        t0 = max(0.0, h0 - REPAIR_CTX_S)
+        t1 = min(dur, h1 + REPAIR_CTX_S)
+        clip = audio[int(t0 * sr): int(t1 * sr)]
+        if clip.shape[0] < 1600:
+            continue
+        for seg in _convert_to_canonical(transcribe_clip(clip), time_offset=t0):
+            inhole = [
+                w for w in seg.get("words") or [] if h0 - 0.3 <= w["start"] <= h1 + 0.3
+            ]
+            if inhole:
+                added.append(
+                    {
+                        "start": inhole[0]["start"],
+                        "end": inhole[-1]["end"],
+                        "text": " ".join(w["word"] for w in inhole).strip(),
+                        "language": "en",
+                        "avg_logprob": seg.get("avg_logprob"),
+                        "words": inhole,
+                    }
+                )
+    if not added:
+        return segments
+    log.info("parakeet_holes_repaired", candidates=len(holes), recovered=len(added))
+    return _dedup_overlapping(sorted(segments + added, key=lambda s: s["start"]))

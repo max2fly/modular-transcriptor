@@ -8,8 +8,28 @@ import pytest
 from modular_transcriptor.finalize import (
     MODEL_NAME,
     PRODUCED_BY_VERSION,
+    _split_words_into_captions,
     finalize_run,
 )
+
+
+def test_split_prefers_largest_gap_when_cap_forces_a_break():
+    # A run-on (>RESEG_MAX_S, no punctuation) with a SMALL gap early and a
+    # LARGER gap later. The forced break must land at the largest gap (the more
+    # sentence-like pause), not the first qualifying breath.
+    words = []
+    t = 0.0
+    for k in range(30):
+        words.append({"word": f"w{k}", "start": t, "end": t + 0.5, "score": 1.0})
+        gap = 0.1
+        if k == 5:
+            gap = 0.6  # modest pause, qualifies but is not the largest
+        elif k == 12:
+            gap = 1.5  # the largest pause -> the preferred break
+        t += 0.5 + gap
+    caps = _split_words_into_captions(words)
+    assert len(caps) >= 2
+    assert caps[0][-1]["word"] == "w12"  # cut at the largest gap, not w5
 
 
 def _write_parakeet(work: Path, segments: list[dict]) -> None:
@@ -58,8 +78,8 @@ def test_lean_schema_and_source(tmp_path):
     assert out["language"] == "en" and out["compute_type"] == "float16"
     assert out["duration_s"] == pytest.approx(seg["end"])
     word = seg["words"][0]
-    assert set(word) >= {"start", "end", "word"}
-    assert "score" not in word
+    assert set(word) >= {"start", "end", "word", "score"}
+    assert word["score"] == 0.9  # per-word confidence carried through for debug
 
 
 def test_long_unpunctuated_segment_is_resegmented_at_pauses(tmp_path):

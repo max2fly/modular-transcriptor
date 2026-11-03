@@ -36,14 +36,22 @@ def test_amplify_builds_command_and_writes_sidecar(monkeypatch, tmp_path):
 
     cmd = state["cmd"]
     assert cmd[0] == "ffmpeg"
-    assert any("volume=6dB,alimiter=limit=0.95" in a for a in cmd)
+    # flat gain, NO limiter (alimiter measurably degrades decoding)
+    assert any("volume=6dB,aresample=async=1" in a for a in cmd)
+    assert not any("alimiter" in a for a in cmd)
     assert "16000" in cmd
     assert state["kwargs"]["check"] is True
 
-    # sidecar records the exact source identity the WAV was made from
+    # sidecar records the source identity AND the gain the WAV was made with,
+    # so a later gain / filter change re-extracts rather than reusing a WAV
+    # built by the old chain.
     sc = json.loads((dst.with_name(dst.name + ".src.json")).read_text())
     st = src.stat()
-    assert sc == {"src_size": st.st_size, "src_mtime_ns": st.st_mtime_ns}
+    assert sc == {
+        "src_size": st.st_size,
+        "src_mtime_ns": st.st_mtime_ns,
+        "extra": {"gain_db": 6},
+    }
 
 
 def test_amplify_reuses_when_source_unchanged(monkeypatch, tmp_path):

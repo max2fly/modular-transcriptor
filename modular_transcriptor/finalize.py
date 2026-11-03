@@ -23,34 +23,61 @@ _SENT_END = (".", "!", "?")
 
 
 def _split_words_into_captions(words: list[dict]) -> list[list[dict]]:
-    """Group word-timestamp dicts into caption-sized runs, breaking at sentence
-    punctuation or a pause once the run is long enough, and force-breaking at
-    RESEG_MAX_S so nothing runs on."""
+    """Group word-timestamp dicts into caption-sized runs.
+
+    This only ever runs on a run-on (a Parakeet segment whose PnC collapsed into
+    one >RESEG_MAX_S unpunctuated block), so there are few real boundaries to go
+    on. For each caption we scan ahead and cut at, in order of preference: the
+    first sentence punctuation past RESEG_MIN_S (a true boundary); else, when the
+    RESEG_MAX_S cap forces a cut, the LARGEST qualifying word-gap in the window
+    rather than the first — the old code broke at the first >=RESEG_GAP_S breath,
+    which chopped a sentence at an incidental pause (lowercase continuation) when
+    a bigger, more sentence-like silence sat a little further on. The trailing
+    sub-cap remainder is kept whole (fewer, better-placed breaks)."""
     caps: list[list[dict]] = []
-    cur: list[dict] = []
-    for w in words:
-        if cur:
-            gap = w["start"] - cur[-1]["end"]
-            dur = cur[-1]["end"] - cur[0]["start"]
-            ends_sentence = cur[-1]["word"].rstrip()[-1:] in _SENT_END
-            if (
-                dur >= RESEG_MAX_S
-                or (dur >= RESEG_MIN_S and (ends_sentence or gap >= RESEG_GAP_S))
-            ):
-                caps.append(cur)
-                cur = []
-        cur.append(w)
-    if cur:
-        caps.append(cur)
+    i = 0
+    n = len(words)
+    while i < n:
+        start_t = words[i]["start"]
+        sentence_cut: int | None = None
+        hardcap_cut: int | None = None
+        best_gap = -1.0
+        best_gap_cut: int | None = None
+        j = i + 1
+        while j < n:
+            prev = words[j - 1]
+            dur = prev["end"] - start_t
+            if dur >= RESEG_MAX_S:
+                hardcap_cut = j
+                break
+            if dur >= RESEG_MIN_S:
+                if prev["word"].rstrip()[-1:] in _SENT_END:
+                    sentence_cut = j
+                    break
+                gap = words[j]["start"] - prev["end"]
+                if gap >= RESEG_GAP_S and gap > best_gap:
+                    best_gap, best_gap_cut = gap, j
+            j += 1
+        if sentence_cut is not None:
+            cut = sentence_cut
+        elif hardcap_cut is not None:
+            # forced by the cap: prefer the largest natural pause in the window
+            # over a mid-utterance chop at the cap.
+            cut = best_gap_cut if best_gap_cut is not None else hardcap_cut
+        else:
+            cut = n  # reached the end: keep the remainder whole
+        caps.append(words[i:cut])
+        i = cut
     return caps
 
 
 def _lean_segments(parakeet: dict) -> list[dict]:
     """Project each raw Parakeet segment onto the lean transcript schema,
-    dropping per-word `score`/`language` and tagging source + kind. Segments
-    longer than RESEG_MAX_S are re-segmented on their word timestamps into
-    caption-sized pieces (Parakeet occasionally emits a whole chunk as one
-    unpunctuated run-on)."""
+    dropping per-word `language` and tagging source + kind. Per-word `score`
+    (model confidence) IS carried through so the transcript keeps a per-word
+    low-confidence signal for debugging. Segments longer than RESEG_MAX_S are
+    re-segmented on their word timestamps into caption-sized pieces (Parakeet
+    occasionally emits a whole chunk as one unpunctuated run-on)."""
     lean: list[dict] = []
     for seg in parakeet.get("segments") or []:
         words = [
@@ -58,6 +85,7 @@ def _lean_segments(parakeet: dict) -> list[dict]:
                 "start": float(w["start"]),
                 "end": float(w["end"]),
                 "word": w["word"],
+                "score": w.get("score"),
             }
             for w in (seg.get("words") or [])
         ]
