@@ -198,3 +198,54 @@ def test_writes_all_sidecar_files(tmp_path):
     assert debug["segments"] == out_dict["segments"]
     md = (work_parent / "transcript.debug.md").read_text()
     assert md.count("\n") >= 1
+
+
+def test_reads_v2_diarization_turns(tmp_path):
+    # Task 1's v2 dict: turns live under "turns"; embeddings etc. are ignored by
+    # finalize. Segments must still get speakers and diarized must be True.
+    work = tmp_path / "work"
+    _write_parakeet(work, _one_segment())
+    (work / "diarization.json").write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "turns": [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}],
+                "embeddings": {"SPEAKER_00": [0.0] * 256},
+                "embedding_model": "pyannote/embedding",
+                "embedding_dim": 256,
+            }
+        )
+    )
+    finalize_run(work)
+    out = json.loads((tmp_path / "transcript.json").read_text())
+    assert out["segments"][0]["speaker"] == "SPEAKER_00"
+    assert out["segments"][0]["words"][0]["speaker"] == "SPEAKER_00"
+    assert out["diarized"] is True
+
+
+def test_reads_legacy_list_diarization(tmp_path):
+    # v1 bare-list form must keep working (back-compat for older runs).
+    out = _run_finalize(tmp_path, with_diar=True)
+    assert out["segments"][0]["speaker"] == "SPEAKER_00"
+    assert out["diarized"] is True
+
+
+def test_empty_v2_is_not_diarized(tmp_path):
+    # A v2 dict with no turns -> not diarized, speakers all None.
+    work = tmp_path / "work"
+    _write_parakeet(work, _one_segment())
+    (work / "diarization.json").write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "turns": [],
+                "embeddings": {},
+                "embedding_model": "pyannote/embedding",
+                "embedding_dim": 256,
+            }
+        )
+    )
+    finalize_run(work)
+    out = json.loads((tmp_path / "transcript.json").read_text())
+    assert out["diarized"] is False
+    assert all(s["speaker"] is None for s in out["segments"])

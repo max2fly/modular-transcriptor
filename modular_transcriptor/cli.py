@@ -9,6 +9,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+from modular_transcriptor._logging import get_logger
+
+log = get_logger("cli")
+
 # Engine stages run in order; each is a subprocess so its GPU model is freed
 # before the next loads. 'pyannote' is conditional; 'finalize' always runs last.
 _PRE_DIARIZE_STAGES = ["amplify", "parakeet"]
@@ -120,12 +124,19 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _run_stage("pyannote", work, inp)
             diar = work / "diarization.json"
-            turns = json.loads(diar.read_text()) if diar.exists() else []
+            data = json.loads(diar.read_text()) if diar.exists() else []
+            # diarization.json is the v2 dict {"schema":2,"turns":[...]} but may
+            # still be a legacy bare list; parse turns inline to keep cli self-
+            # contained (no import of finalize's helper).
+            turns = data if isinstance(data, list) else data.get("turns", [])
             if not turns:
-                raise SystemExit(
-                    "Diarization produced no speakers — the pyannote model is likely "
-                    "not cached/accepted. Accept it on HuggingFace and set HF_TOKEN, "
-                    "or re-run with --no-diarization."
+                # Don't abort: a failed/empty diarization must NOT skip finalize
+                # and regress to no transcript. Warn and finalize non-diarized.
+                log.warning(
+                    "diarization_empty_proceeding",
+                    detail="pyannote produced no speaker turns; finalizing a "
+                    "non-diarized transcript (the model may not be "
+                    "cached/accepted)",
                 )
 
         _run_stage("finalize", work, inp)

@@ -161,6 +161,16 @@ def _merge_abbrev_splits(segments: list[dict]) -> list[dict]:
     return out
 
 
+def _load_turns(diar_json: list | dict) -> list[dict]:
+    """Extract diarization turns from either schema. v1 is a bare list of
+    `{start,end,speaker}`; Task 1's v2 is a dict `{"schema":2,"turns":[...],
+    "embeddings":{...},...}`. finalize consumes only the turns (the clipper
+    reads the embeddings), so the two shapes collapse to one list here."""
+    if isinstance(diar_json, list):
+        return diar_json
+    return diar_json.get("turns", [])
+
+
 def finalize_run(work: Path, emit: PhaseCb | None = None) -> None:
     """Turn `work/parakeet.json` (+ optional `work/diarization.json`) into the
     final `transcript.json` and its sidecars in `work.parent`.
@@ -183,7 +193,7 @@ def finalize_run(work: Path, emit: PhaseCb | None = None) -> None:
     lean = _merge_abbrev_splits(_lean_segments(parakeet))
 
     diar_path = work / "diarization.json"
-    turns = json.loads(diar_path.read_text()) if diar_path.exists() else []
+    turns = _load_turns(json.loads(diar_path.read_text())) if diar_path.exists() else []
 
     _emit("assigning speakers", 80.0)
     assign_speakers(lean, turns)

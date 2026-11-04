@@ -40,7 +40,12 @@ def _stage_parakeet(work, audio, emit, boost_file=None, boost_alpha=None):
 def _stage_pyannote(work, audio, emit):
     from modular_transcriptor.pyannote_diarize import run
 
-    run(_p(work, "audio.amplified.wav"), _p(work, "diarization.json"), phase_cb=emit)
+    run(
+        _p(work, "audio.amplified.wav"),
+        _p(work, "diarization.json"),
+        phase_cb=emit,
+        words_path=_p(work, "parakeet.json"),
+    )
 
 
 def _stage_finalize(work, audio, emit):

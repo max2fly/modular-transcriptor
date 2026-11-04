@@ -71,14 +71,31 @@ def test_cli_requires_hf_token_by_default(tmp_path, monkeypatch):
     assert "HF_TOKEN" in str(e.value)
 
 
-def test_cli_errors_when_diarization_empty(tmp_path, monkeypatch):
-    inp, _ = _fake_pipeline(
+def test_empty_diarization_still_finalizes(tmp_path, monkeypatch):
+    # Empty diarization must NOT abort: we log a warning and finalize anyway so
+    # a (non-diarized) transcript is still produced instead of regressing to none.
+    inp, calls = _fake_pipeline(
         monkeypatch, tmp_path, diar_turns=[]
     )  # model produced nothing
     monkeypatch.setenv("HF_TOKEN", "x")
-    with pytest.raises(SystemExit) as e:
-        cli.main([str(inp)])
-    assert "no speakers" in str(e.value).lower()
+    out = tmp_path / "empty.json"
+    rc = cli.main([str(inp), "--out", str(out)])  # must NOT raise SystemExit
+    assert rc == 0
+    assert calls == ["amplify", "parakeet", "pyannote", "finalize"]
+    assert out.exists()
+
+
+def test_empty_diarization_v2_dict_still_finalizes(tmp_path, monkeypatch):
+    # v2 shape with an empty turns list behaves the same as a legacy empty list.
+    inp, calls = _fake_pipeline(
+        monkeypatch, tmp_path, diar_turns={"schema": 2, "turns": []}
+    )
+    monkeypatch.setenv("HF_TOKEN", "x")
+    out = tmp_path / "empty_v2.json"
+    rc = cli.main([str(inp), "--out", str(out)])
+    assert rc == 0
+    assert calls == ["amplify", "parakeet", "pyannote", "finalize"]
+    assert out.exists()
 
 
 def test_cli_diarization_success(tmp_path, monkeypatch):
